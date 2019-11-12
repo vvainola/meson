@@ -57,18 +57,24 @@ _packages_accept_language = set()
 GIO_CANCELLABLE = None
 
 class DependencyProviderMode(Enum):
-    WARN = 'warn'
-    ASK = 'ask'
-    INSTALL_REQUIRED = 'install-required'
+    DISABLED = 'disabled'
+    INFO = 'info'
+    ASK_REQUIRED = 'ask'
+    ASK_ALL = 'ask-all'
+    INSTALL_REQUIRED = 'install'
     INSTALL_ALL = 'install-all'
 
     @classmethod
     def from_string(cls, mode):
-        if mode == 'warn':
-            return cls.WARN
+        if mode == 'disabled':
+            return cls.DISABLED
+        if mode == 'info':
+            return cls.INFO
         if mode == 'ask':
-            return cls.ASK
-        if mode == 'install-required':
+            return cls.ASK_REQUIRED
+        if mode == 'ask-all':
+            return cls.ASK_ALL
+        if mode == 'install':
             return cls.INSTALL_REQUIRED
         if mode == 'install-all':
             return cls.INSTALL_ALL
@@ -89,6 +95,9 @@ class PackageKitDependencyProvider:
             raise MesonException('PackageKit was previously detected as not available')
         # Assume it isn't available, and set it as True if it is
         PackageKitDependencyProvider.have_packagekit = False
+        self.install_mode = self._get_install_mode()
+        if self.install_mode == DependencyProviderMode.DISABLED:
+            raise MesonException('Dependency provider is disabled')
         # Sanity checks
         try:
             control = PackageKitGlib.Control()
@@ -111,7 +120,6 @@ class PackageKitDependencyProvider:
         except GLib.Error as e:
             raise MesonException('Failed to initialize PackagKit objects: {}'.format(str(e)))
         self.pcname = pcname
-        self.install_mode = self._get_install_mode()
         # Cancel all operations on SIGINT
         GIO_CANCELLABLE = self.cancellable
         signal.signal(signal.SIGINT, self._sigint_handler)
@@ -123,6 +131,7 @@ class PackageKitDependencyProvider:
     def _sigint_handler(sig, frame):
         GIO_CANCELLABLE.cancel()
         signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
 
     @staticmethod
     def _get_task():
@@ -176,13 +185,14 @@ class PackageKitDependencyProvider:
         package = packages[-1]
         return package
 
-    @staticmethod
-    def _get_install_mode():
-        mode = os.environ.get('MESON_DEP_PROVIDER_MODE', 'warn').lower()
+    @classmethod
+    def _get_install_mode(cls):
+        mode = os.environ.get('MESON_DEP_PROVIDER_MODE', 'disabled').lower()
         install_mode = DependencyProviderMode.from_string(mode)
-        if not sys.stdout.isatty():
-            mlog.debug('Not an interactive terminal, setting install mode to WARN')
-            install_mode = DependencyProviderMode.WARN
+        if install_mode not in (DependencyProviderMode.INFO, DependencyProviderMode.DISABLED) \
+           and not sys.stdout.isatty():
+            mlog.debug('Not an interactive terminal, setting install mode to INFO')
+            install_mode = DependencyProviderMode.INFO
         return install_mode
 
     def install_package(self, package):
@@ -835,25 +845,57 @@ class PkgConfigDependency(ExternalDependency):
         package = provider.find_package()
         if not package:
             return False
+
+        def _print_dep_provider(pcname, pkgname, required):
+            dep_type = 'Dependency' if required else 'Optional dependency'
+            mlog.log(dep_type, mlog.bold(pcname), 'can be provided by installing the package',
+                     mlog.bold(pkgname))
+
         pkgname = package.get_name()
-        if provider.install_mode == DependencyProviderMode.WARN or \
+        if provider.install_mode == DependencyProviderMode.INFO or \
            (provider.install_mode == DependencyProviderMode.INSTALL_REQUIRED and not required):
-            mlog.warning('Dependency {!r} can be provided by installing the '
-                         'package {!r}'.format(pcname, pkgname))
+            _print_dep_provider(pcname, pkgname, required)
             return False
-        if provider.install_mode == DependencyProviderMode.ASK:
-            print('Install package {!r} to provide dependency {!r}? [N/y] '
-                  ''.format(pkgname, pcname), end='')
+        if provider.install_mode.value.startswith('ask'):
+            if required:
+                dep_type = 'mandatory dependency'
+                skip_type = 'all'
+            elif provider.install_mode == DependencyProviderMode.ASK_REQUIRED:
+                # Don't ask to install optional deps
+                _print_dep_provider(pcname, pkgname, required)
+                return False
+            else:
+                dep_type = 'optional dependency'
+                skip_type = 'optional'
+            mlog.log('Install package {!r} for {} {!r}?' .format(pkgname, dep_type, pcname),
+                     mlog.bold('<[N]o'), '/', mlog.bold('[y]es'), '/',
+                     mlog.bold('[s]kip {}> '.format(skip_type)), end='')
             try:
-                response = input()
+                response = input().lower()
             except EOFError:
                 response = 'n'
-            if response.lower() not in ('y', 'yes'):
+            if response not in ('y', 'yes'):
+                if response in ('s', 'skip', 'skip all'):
+                    if required:
+                        # Inform about dependency providers
+                        os.environ['MESON_DEP_PROVIDER_MODE'] = 'info'
+                    else:
+                        # Only ask for required dependencies
+                        os.environ['MESON_DEP_PROVIDER_MODE'] = 'ask'
+                _print_dep_provider(pcname, pkgname, required)
                 return False
             return provider.install_package(package)
-        if provider.install_mode.value.startswith('install-'):
-            print('Installing package {!r} to provide dependency {!r}'
-                  ''.format(pkgname, pcname))
+        if provider.install_mode.value.startswith('install'):
+            if required:
+                dep_type = 'mandatory dependency'
+            elif provider.install_mode == DependencyProviderMode.INSTALL_REQUIRED:
+                # Don't install optional deps
+                _print_dep_provider(pcname, pkgname, required)
+                return False
+            else:
+                dep_type = 'optional dependency'
+            print('Installing package {!r} for {} {!r}'
+                  ''.format(pkgname, dep_type, pcname))
             return provider.install_package(package)
 
     def _call_pkgbin_real(self, args, env, try_provider=True):
