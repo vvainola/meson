@@ -18,6 +18,7 @@ import copy
 import functools
 import os
 import re
+import sys
 import json
 import shlex
 import shutil
@@ -27,6 +28,16 @@ import typing
 from typing import Any, Dict, List, Tuple
 from enum import Enum
 from pathlib import Path, PurePath
+
+try:
+    import gi
+    import signal
+    gi.require_version('PackageKitGlib', '1.0')
+    from gi.repository import Gio, GLib
+    from gi.repository import PackageKitGlib
+    HAVE_PACKAGEKIT = True
+except ImportError:
+    HAVE_PACKAGEKIT = False
 
 from .. import mlog
 from .. import mesonlib
@@ -41,6 +52,148 @@ from ..mesonlib import Version, LibType
 # These must be defined in this file to avoid cyclical references.
 packages = {}
 _packages_accept_language = set()
+
+# Signal handler data, needs to be global
+GIO_CANCELLABLE = None
+
+class DependencyProviderMode(Enum):
+    WARN = 'warn'
+    ASK = 'ask'
+    INSTALL_REQUIRED = 'install-required'
+    INSTALL_ALL = 'install-all'
+
+    @classmethod
+    def from_string(cls, mode):
+        if mode == 'warn':
+            return cls.WARN
+        if mode == 'ask':
+            return cls.ASK
+        if mode == 'install-required':
+            return cls.INSTALL_REQUIRED
+        if mode == 'install-all':
+            return cls.INSTALL_ALL
+        raise MesonException('Invalid install mode: {!r}'.format(mode))
+
+class PackageKitDependencyProvider:
+    '''
+    Due to DBus timeouts, you should not assume that this object is valid for
+    longer than a minute.
+    '''
+    have_packagekit = None
+
+    def __init__(self, pcname):
+        global GIO_CANCELLABLE
+        if not HAVE_PACKAGEKIT:
+            raise MesonException('PackageKit python bindings are not available')
+        if PackageKitDependencyProvider.have_packagekit is False:
+            raise MesonException('PackageKit was previously detected as not available')
+        # Assume it isn't available, and set it as True if it is
+        PackageKitDependencyProvider.have_packagekit = False
+        # Sanity checks
+        try:
+            control = PackageKitGlib.Control()
+        except Exception as e:
+            raise MesonException('PackageKit python bindings are unusable: {}'.format(str(e)))
+        else:
+            if not control.get_properties():
+                # Failed to connect to daemon
+                raise MesonException('Failed to connect to PackageKit daemon')
+            # Yum is too slow
+            if control.get_property('backend-name') == 'yum':
+                raise MesonException('PackageKit backend is yum, which is too slow')
+        # Try initializing things
+        try:
+            self.error = GLib.Error()
+            self.cancellable = Gio.Cancellable()
+            self.filters = self._get_filters()
+            self.client = PackageKitGlib.Client()
+            self.task = self._get_task()
+        except GLib.Error as e:
+            raise MesonException('Failed to initialize PackagKit objects: {}'.format(str(e)))
+        self.pcname = pcname
+        self.install_mode = self._get_install_mode()
+        # Cancel all operations on SIGINT
+        GIO_CANCELLABLE = self.cancellable
+        signal.signal(signal.SIGINT, self._sigint_handler)
+        # TODO: implement progress feedback
+        self.progress_cb = lambda *args: None
+        PackageKitDependencyProvider.have_packagekit = True
+
+    @staticmethod
+    def _sigint_handler(sig, frame):
+        GIO_CANCELLABLE.cancel()
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    @staticmethod
+    def _get_task():
+        task = PackageKitGlib.Task()
+        task.set_property('cache-age', GLib.MAXUINT)
+        task.set_property('interactive', False)
+        task.set_property('background', False)
+        return task
+
+    @staticmethod
+    def _get_filters(*enums):
+        bitfield = 0
+        bitfield += 1 << PackageKitGlib.FilterEnum.NOT_INSTALLED
+        bitfield += 1 << PackageKitGlib.FilterEnum.NEWEST
+        bitfield += 1 << PackageKitGlib.FilterEnum.ARCH
+        bitfield += 1 << PackageKitGlib.FilterEnum.DEVELOPMENT
+        return bitfield
+
+    def _handle_search_files_errors(self, results):
+        error_code = results.get_error_code()
+        if not error_code:
+            return True
+        error_enum = PackageKitGlib.Error.get_code(error_code)
+        if error_enum == PackageKitGlib.ErrorEnum.TRANSACTION_CANCELLED:
+            mlog.debug('PackageKit searching for development packages providing {!r} took '
+                       'too long, cancelled'.format(self.pcname))
+            return False
+        mlog.debug('PackageKit searching for development packages providing {!r} failed: {}: {}'
+                   ''.format(self.pcname, PackageKitGlib.ErrorEnum.to_string(error_enum),
+                             PackageKitGlib.Error.get_details(error_code)))
+        return False
+
+    @staticmethod
+    def _get_files_from_pcname(pcname):
+        # TODO: Find a cross-distro way of detecting this
+        return ['/usr/lib64/pkgconfig/{}.pc'.format(pcname)]
+
+    def find_package(self):
+        files = self._get_files_from_pcname(self.pcname)
+        results = self.client.search_files(self.filters, files, self.cancellable,
+                                           self.progress_cb, None, self.error)
+        ret = self._handle_search_files_errors(results)
+        if not ret:
+            return None
+        packages = results.get_package_array()
+        if not packages:
+            mlog.debug('PackageKit found no development packages providing pcname {!r}'
+                       ''.format(self.pcname))
+            return None
+        # There should be only one, but just in case, get the newest
+        package = packages[-1]
+        return package
+
+    @staticmethod
+    def _get_install_mode():
+        mode = os.environ.get('MESON_DEP_PROVIDER_MODE', 'warn').lower()
+        install_mode = DependencyProviderMode.from_string(mode)
+        if not sys.stdout.isatty():
+            mlog.debug('Not an interactive terminal, setting install mode to WARN')
+            install_mode = DependencyProviderMode.WARN
+        return install_mode
+
+    def install_package(self, package):
+        pkg_id = package.get_id()
+        try:
+            self.task.install_packages(0, [pkg_id], self.cancellable, self.progress_cb, None, self.error)
+        except GLib.Error as e:
+            mlog.log('PackageKit installation of package {!r} failed: {}'
+                     ''.format(package.get_name(), str(e)))
+            return False
+        return True
 
 
 class DependencyException(MesonException):
@@ -671,10 +824,47 @@ class PkgConfigDependency(ExternalDependency):
         return s.format(self.__class__.__name__, self.name, self.is_found,
                         self.version_reqs)
 
-    def _call_pkgbin_real(self, args, env):
+    @staticmethod
+    def _try_to_provide_missing_pcname(pcname, required):
+        '''TODO: don't do this when not using system pkg-config files'''
+        try:
+            provider = PackageKitDependencyProvider(pcname)
+        except MesonException as e:
+            mlog.debug(str(e))
+            return False
+        package = provider.find_package()
+        if not package:
+            return False
+        pkgname = package.get_name()
+        if provider.install_mode == DependencyProviderMode.WARN or \
+           (provider.install_mode == DependencyProviderMode.INSTALL_REQUIRED and not required):
+            mlog.warning('Dependency {!r} can be provided by installing the '
+                         'package {!r}'.format(pcname, pkgname))
+            return False
+        if provider.install_mode == DependencyProviderMode.ASK:
+            print('Install package {!r} to provide dependency {!r}? [N/y] '
+                  ''.format(pkgname, pcname), end='')
+            try:
+                response = input()
+            except EOFError:
+                response = 'n'
+            if response.lower() not in ('y', 'yes'):
+                return False
+            return provider.install_package(package)
+        if provider.install_mode.value.startswith('install-'):
+            print('Installing package {!r} to provide dependency {!r}'
+                  ''.format(pkgname, pcname))
+            return provider.install_package(package)
+
+    def _call_pkgbin_real(self, args, env, try_provider=True):
         cmd = self.pkgbin.get_command() + args
         p, out, err = Popen_safe(cmd, env=env)
         rc, out, err = p.returncode, out.strip(), err.strip()
+        if try_provider and rc != 0 and '--modversion' in args:
+            provided = self._try_to_provide_missing_pcname(self.name, self.required)
+            # Try again
+            if provided:
+                return self._call_pkgbin_real(args, env, try_provider=False)
         call = ' '.join(cmd)
         mlog.debug("Called `{}` -> {}\n{}".format(call, rc, out))
         return rc, out, err
