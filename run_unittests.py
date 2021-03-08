@@ -6264,6 +6264,14 @@ class WindowsTests(BasePlatformTests):
         self.init(os.path.join(self.unit_test_dir, '87 cpp modules'))
         self.build()
 
+    def test_debug_info_format(self):
+        env = get_fake_env()
+        cc = env.detect_c_compiler(MachineChoice.HOST)
+        if cc.get_argument_syntax() != 'msvc':
+            raise unittest.SkipTest('Test only applies to MSVC-like compilers')
+        self.init(os.path.join(self.unit_test_dir, '94 debug info'))
+        out = self.build()
+        self.assertNotRegex(out, r'warning D9025') #: overriding \'/Zi\' with \'/Z7\'')
 
 @unittest.skipUnless(is_osx(), "requires Darwin")
 class DarwinTests(BasePlatformTests):
